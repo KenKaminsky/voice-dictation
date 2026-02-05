@@ -16,6 +16,7 @@ from recorder import AudioRecorder, RECORDINGS_DIR
 from transcriber import get_transcriber
 from paster import get_paster
 from storage import get_history
+from floating_indicator import get_indicator
 
 
 class VoiceDictationApp(rumps.App):
@@ -46,6 +47,7 @@ class VoiceDictationApp(rumps.App):
         self.recorder = AudioRecorder()
         self.paster = get_paster()
         self.history = get_history()
+        self.indicator = get_indicator()
         self.last_audio_file: Optional[str] = None
         self.last_duration: float = 0
 
@@ -129,6 +131,10 @@ class VoiceDictationApp(rumps.App):
         required = config.HOTKEY_MODIFIERS | {config.HOTKEY_KEY}
         return required.issubset(self.held_keys)
 
+    def _on_audio_chunk(self, chunk):
+        """Called with each audio chunk during recording."""
+        self.indicator.update_waveform(chunk)
+
     def _on_hotkey_press(self):
         """Called when hotkey is pressed - start recording."""
         if self.is_recording:
@@ -138,7 +144,12 @@ class VoiceDictationApp(rumps.App):
         self.is_recording = True
         self.update_icon(config.ICON_RECORDING)
         self.update_status("Recording...")
-        self.recorder.start()
+
+        # Show floating indicator
+        self.indicator.show_recording()
+
+        # Start recording with live audio callback
+        self.recorder.start(on_audio_chunk=self._on_audio_chunk)
 
     def _on_hotkey_release(self):
         """Called when hotkey is released - stop recording and transcribe."""
@@ -149,6 +160,9 @@ class VoiceDictationApp(rumps.App):
         self.is_recording = False
         self.update_icon(config.ICON_PROCESSING)
         self.update_status("Transcribing...")
+
+        # Show processing state
+        self.indicator.show_processing()
 
         # Stop recording and get audio
         audio = self.recorder.stop()
@@ -169,11 +183,15 @@ class VoiceDictationApp(rumps.App):
                 print("Audio too short, skipping")
                 self.update_status("Ready (audio too short)")
                 self.update_icon(config.ICON_IDLE)
+                self.indicator.hide()
                 return
 
             # Transcribe
             transcriber = get_transcriber()
             text = transcriber.transcribe(audio)
+
+            # Hide indicator
+            self.indicator.hide()
 
             if text:
                 # Save to history
@@ -194,6 +212,7 @@ class VoiceDictationApp(rumps.App):
         except Exception as e:
             print(f"Transcription error: {e}")
             self.update_status(f"Error: {str(e)[:30]}")
+            self.indicator.hide()
 
         finally:
             self.update_icon(config.ICON_IDLE)
@@ -201,8 +220,6 @@ class VoiceDictationApp(rumps.App):
     @rumps.clicked("View History")
     def view_history_clicked(self, sender):
         """Show history window in a separate process."""
-        import subprocess
-        import sys
         import os
 
         # Launch history viewer as separate process

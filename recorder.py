@@ -24,18 +24,29 @@ class AudioRecorder:
         self.audio_data: list[np.ndarray] = []
         self.stop_event = Event()
         self.last_saved_file: Optional[Path] = None
+        self.on_audio_chunk = None  # Callback for live audio data
+        self.latest_chunk: Optional[np.ndarray] = None
 
-    def start(self):
-        """Start recording audio."""
+    def start(self, on_audio_chunk=None):
+        """Start recording audio. Optional callback receives live audio chunks."""
         self.recording = True
         self.audio_data = []
         self.stop_event.clear()
+        self.on_audio_chunk = on_audio_chunk
 
         def callback(indata, frames, time, status):
             if status:
                 print(f"Recording status: {status}")
             if self.recording:
+                chunk = indata.copy().flatten()
                 self.audio_data.append(indata.copy())
+                self.latest_chunk = chunk
+                # Call the live audio callback if set
+                if self.on_audio_chunk:
+                    try:
+                        self.on_audio_chunk(chunk)
+                    except Exception:
+                        pass
 
         self.stream = sd.InputStream(
             samplerate=self.sample_rate,

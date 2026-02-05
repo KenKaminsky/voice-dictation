@@ -14,9 +14,10 @@ MODEL_ID = "mlx-community/whisper-large-v3-turbo"
 
 # App settings
 APP_NAME = "Voice Dictation"
-ICON_IDLE = "🎤"
-ICON_RECORDING = "🔴"
-ICON_PROCESSING = "⏳"
+# Menu bar icons - using simple text/emoji for visibility
+ICON_IDLE = "◉"  # Simple dot when idle
+ICON_RECORDING = "◉ REC"  # Orange indicator when recording
+ICON_PROCESSING = "◉ ..."  # Processing indicator
 
 # Paste method: "clipboard" (Cmd+V) or "typing" (simulate keystrokes)
 PASTE_METHOD = "clipboard"
