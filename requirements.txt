@@ -1,0 +1,8 @@
+rumps>=0.4.0
+pynput>=1.7.6
+sounddevice>=0.4.6
+numpy>=1.24.0
+pyperclip>=1.8.2
+torch>=2.0.0
+transformers>=4.36.0
+accelerate>=0.25.0

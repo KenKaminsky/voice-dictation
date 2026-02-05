@@ -1,0 +1,7 @@
+#!/bin/bash
+# Voice Dictation launcher
+
+APP_DIR="/Users/kenkaminsky/Personal-Notebooks/voice-dictation"
+cd "$APP_DIR"
+source venv/bin/activate
+exec python app.py
