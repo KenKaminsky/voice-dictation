@@ -1,6 +1,8 @@
 """Floating recording indicator with waveform visualization."""
 
 import numpy as np
+import objc
+from Foundation import NSObject
 from AppKit import (
     NSApplication,
     NSWindow,
@@ -20,7 +22,7 @@ from AppKit import (
     NSFontAttributeName,
     NSParagraphStyleAttributeName,
 )
-from Quartz import CGDisplayBounds, CGMainDisplayID
+from PyObjCTools import AppHelper
 import threading
 import time
 
@@ -29,7 +31,7 @@ class WaveformView(NSView):
     """Custom view that draws audio waveform."""
 
     def initWithFrame_(self, frame):
-        self = super().initWithFrame_(frame)
+        self = objc.super(WaveformView, self).initWithFrame_(frame)
         if self:
             self.waveform_data = np.zeros(50)
             self.status_text = "Recording..."
@@ -114,18 +116,21 @@ class WaveformView(NSView):
         text.drawInRect_(text_rect)
 
 
-class FloatingIndicator:
-    """Floating window that shows recording status and waveform."""
+class IndicatorController(NSObject):
+    """Controller that handles main thread operations."""
 
-    def __init__(self):
-        self.window = None
-        self.waveform_view = None
-        self._is_visible = False
-        self._animation_thread = None
-        self._should_animate = False
+    def init(self):
+        self = objc.super(IndicatorController, self).init()
+        if self:
+            self.window = None
+            self.waveform_view = None
+            self._is_visible = False
+            self._should_animate = False
+            self._pending_waveform = None
+        return self
 
-    def _create_window(self):
-        """Create the floating window."""
+    def createWindow(self):
+        """Create the floating window on main thread."""
         if self.window is not None:
             return
 
@@ -160,67 +165,89 @@ class FloatingIndicator:
         self.waveform_view = WaveformView.alloc().initWithFrame_(content_frame)
         self.window.setContentView_(self.waveform_view)
 
-    def show(self, status="Recording..."):
-        """Show the indicator."""
-        def _show():
-            self._create_window()
-            self.waveform_view.setStatusText_(status)
-            self.waveform_view.setProcessing_(False)
-            self.window.orderFront_(None)
-            self._is_visible = True
-
-        # Run on main thread
-        from AppKit import NSApp
-        if NSApp:
-            NSApp.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "_showIndicator:", None, True
-            )
-        else:
-            _show()
-
-    def show_recording(self):
-        """Show recording state with animation."""
-        self._create_window()
+    def showRecording_(self, _):
+        """Show recording state."""
+        self.createWindow()
         self.waveform_view.setStatusText_("Recording...")
         self.waveform_view.setProcessing_(False)
         self.window.orderFront_(None)
         self._is_visible = True
         self._should_animate = True
 
-    def show_processing(self):
+    def showProcessing_(self, _):
         """Show processing state."""
         if self.window and self.waveform_view:
             self._should_animate = False
             self.waveform_view.setStatusText_("Transcribing...")
             self.waveform_view.setProcessing_(True)
-            # Animate processing dots
-            self._animate_processing()
+            # Start animation thread
+            thread = threading.Thread(target=self._animate_processing, daemon=True)
+            thread.start()
 
     def _animate_processing(self):
-        """Animate processing dots."""
-        def animate():
-            dots = 0
-            while self._is_visible and not self._should_animate:
-                dots = (dots % 3) + 1
-                text = "Transcribing" + "." * dots
-                if self.waveform_view:
-                    self.waveform_view.setStatusText_(text)
-                time.sleep(0.3)
+        """Animate processing dots in background."""
+        dots = 0
+        while self._is_visible and not self._should_animate:
+            dots = (dots % 3) + 1
+            text = "Transcribing" + "." * dots
+            # Update on main thread
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "updateStatusText:", text, False
+            )
+            time.sleep(0.3)
 
-        thread = threading.Thread(target=animate, daemon=True)
-        thread.start()
+    def updateStatusText_(self, text):
+        """Update status text on main thread."""
+        if self.waveform_view:
+            self.waveform_view.setStatusText_(text)
 
-    def update_waveform(self, audio_chunk):
-        """Update waveform with new audio data."""
+    def updateWaveform_(self, data):
+        """Update waveform on main thread."""
         if self.waveform_view and self._is_visible:
-            self.waveform_view.setWaveformData_(audio_chunk)
+            self.waveform_view.setWaveformData_(data)
 
-    def hide(self):
-        """Hide the indicator."""
+    def hide_(self, _):
+        """Hide the indicator on main thread."""
         self._should_animate = False
         self._is_visible = False
         if self.window:
             self.window.orderOut_(None)
+
+
+class FloatingIndicator:
+    """Floating window that shows recording status and waveform."""
+
+    def __init__(self):
+        self.controller = IndicatorController.alloc().init()
+        self._is_visible = False
+
+    def show_recording(self):
+        """Show recording state with animation."""
+        self._is_visible = True
+        self.controller.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showRecording:", None, False
+        )
+
+    def show_processing(self):
+        """Show processing state."""
+        self.controller.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "showProcessing:", None, False
+        )
+
+    def update_waveform(self, audio_chunk):
+        """Update waveform with new audio data."""
+        if self._is_visible:
+            # Convert to NSData-compatible format and update on main thread
+            self.controller.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "updateWaveform:", audio_chunk, False
+            )
+
+    def hide(self):
+        """Hide the indicator."""
+        self._is_visible = False
+        self.controller.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "hide:", None, False
+        )
 
 
 # Singleton instance
