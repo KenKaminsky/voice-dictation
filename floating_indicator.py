@@ -1,10 +1,9 @@
-"""Floating recording indicator with waveform visualization."""
+"""Floating recording indicator - small, smooth, Wispr-like."""
 
 import numpy as np
 import objc
 from Foundation import NSObject
 from AppKit import (
-    NSApplication,
     NSWindow,
     NSView,
     NSColor,
@@ -21,33 +20,60 @@ from AppKit import (
     NSForegroundColorAttributeName,
     NSFontAttributeName,
     NSParagraphStyleAttributeName,
+    NSEvent,
 )
-from PyObjCTools import AppHelper
 import threading
 import time
+from collections import deque
 
 
 class WaveformView(NSView):
-    """Custom view that draws audio waveform."""
+    """Custom view that draws a smooth audio waveform."""
 
     def initWithFrame_(self, frame):
         self = objc.super(WaveformView, self).initWithFrame_(frame)
         if self:
-            self.waveform_data = np.zeros(50)
-            self.status_text = "Recording..."
+            # Smooth waveform with 20 bars
+            self.num_bars = 20
+            self.waveform_data = deque([0.1] * self.num_bars, maxlen=self.num_bars)
+            self.target_data = [0.1] * self.num_bars
+            self.status_text = "Recording"
             self.is_processing = False
+            # Animation smoothing
+            self._smoothing = 0.3  # Lower = smoother
         return self
 
-    def setWaveformData_(self, data):
-        """Update waveform data and redraw."""
-        if len(data) > 0:
-            # Resample to 50 points for display
-            indices = np.linspace(0, len(data) - 1, 50).astype(int)
-            self.waveform_data = np.abs(data[indices])
-            # Normalize
-            max_val = np.max(self.waveform_data)
-            if max_val > 0:
-                self.waveform_data = self.waveform_data / max_val
+    def updateWaveform_(self, raw_data):
+        """Update waveform with smoothed data."""
+        if raw_data is None or len(raw_data) == 0:
+            return
+
+        # Resample to num_bars points
+        chunk_size = len(raw_data) // self.num_bars
+        if chunk_size == 0:
+            return
+
+        new_values = []
+        for i in range(self.num_bars):
+            start = i * chunk_size
+            end = start + chunk_size
+            # RMS for smoother visualization
+            chunk = raw_data[start:end]
+            rms = np.sqrt(np.mean(chunk ** 2))
+            new_values.append(rms)
+
+        # Normalize
+        max_val = max(new_values) if max(new_values) > 0 else 1
+        new_values = [v / max_val for v in new_values]
+
+        # Smooth transition
+        for i in range(self.num_bars):
+            current = list(self.waveform_data)[i]
+            target = new_values[i]
+            # Exponential smoothing
+            smoothed = current + self._smoothing * (target - current)
+            self.waveform_data[i] = max(0.08, min(1.0, smoothed))
+
         self.setNeedsDisplay_(True)
 
     def setStatusText_(self, text):
@@ -58,6 +84,10 @@ class WaveformView(NSView):
     def setProcessing_(self, processing):
         """Set processing state."""
         self.is_processing = processing
+        if processing:
+            # Reset to flat bars for processing animation
+            for i in range(self.num_bars):
+                self.waveform_data[i] = 0.3
         self.setNeedsDisplay_(True)
 
     def drawRect_(self, rect):
@@ -66,53 +96,52 @@ class WaveformView(NSView):
         width = bounds.size.width
         height = bounds.size.height
 
-        # Draw rounded background
+        # Draw rounded pill background (dark)
         bg_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            bounds, 16, 16
+            bounds, height / 2, height / 2
         )
-
-        # Background color - orange when recording, blue when processing
-        if self.is_processing:
-            NSColor.colorWithRed_green_blue_alpha_(0.2, 0.4, 0.8, 0.95).setFill()
-        else:
-            NSColor.colorWithRed_green_blue_alpha_(0.9, 0.4, 0.2, 0.95).setFill()
+        NSColor.colorWithRed_green_blue_alpha_(0.1, 0.1, 0.1, 0.95).setFill()
         bg_path.fill()
 
-        # Draw waveform
-        bar_width = 4
-        bar_spacing = 2
-        num_bars = len(self.waveform_data)
-        total_waveform_width = num_bars * (bar_width + bar_spacing)
-        start_x = (width - total_waveform_width) / 2
-        waveform_height = height - 40  # Leave space for text
+        # Waveform area
+        waveform_width = width - 80  # Leave space for text
+        bar_width = 3
+        bar_spacing = (waveform_width - (self.num_bars * bar_width)) / (self.num_bars - 1)
+        start_x = 12
+        max_bar_height = height - 16
 
-        NSColor.whiteColor().setFill()
+        # Color based on state
+        if self.is_processing:
+            NSColor.colorWithRed_green_blue_alpha_(0.4, 0.6, 1.0, 1.0).setFill()
+        else:
+            NSColor.colorWithRed_green_blue_alpha_(1.0, 0.5, 0.3, 1.0).setFill()
 
+        # Draw waveform bars (centered vertically)
         for i, amplitude in enumerate(self.waveform_data):
             x = start_x + i * (bar_width + bar_spacing)
-            bar_height = max(4, amplitude * waveform_height * 0.8)
-            y = (waveform_height - bar_height) / 2 + 30
+            bar_height = max(4, amplitude * max_bar_height * 0.7)
+            y = (height - bar_height) / 2
 
             bar_rect = NSMakeRect(x, y, bar_width, bar_height)
             bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                bar_rect, 2, 2
+                bar_rect, bar_width / 2, bar_width / 2
             )
             bar_path.fill()
 
-        # Draw status text
+        # Draw status text on right side
         paragraph_style = NSMutableParagraphStyle.alloc().init()
         paragraph_style.setAlignment_(NSCenterTextAlignment)
 
         attrs = {
-            NSForegroundColorAttributeName: NSColor.whiteColor(),
-            NSFontAttributeName: NSFont.systemFontOfSize_weight_(13, 0.5),
+            NSForegroundColorAttributeName: NSColor.colorWithRed_green_blue_alpha_(0.7, 0.7, 0.7, 1.0),
+            NSFontAttributeName: NSFont.systemFontOfSize_weight_(11, 0.3),
             NSParagraphStyleAttributeName: paragraph_style,
         }
 
         text = NSAttributedString.alloc().initWithString_attributes_(
             self.status_text, attrs
         )
-        text_rect = NSMakeRect(0, 8, width, 20)
+        text_rect = NSMakeRect(width - 70, (height - 14) / 2, 60, 14)
         text.drawInRect_(text_rect)
 
 
@@ -126,25 +155,35 @@ class IndicatorController(NSObject):
             self.waveform_view = None
             self._is_visible = False
             self._should_animate = False
-            self._pending_waveform = None
+            # Window dimensions - small pill shape
+            self.window_width = 180
+            self.window_height = 36
         return self
+
+    def getActiveScreen(self):
+        """Get the screen where the mouse cursor is located."""
+        mouse_location = NSEvent.mouseLocation()
+        for screen in NSScreen.screens():
+            frame = screen.frame()
+            if (frame.origin.x <= mouse_location.x <= frame.origin.x + frame.size.width and
+                frame.origin.y <= mouse_location.y <= frame.origin.y + frame.size.height):
+                return screen
+        return NSScreen.mainScreen()
 
     def createWindow(self):
         """Create the floating window on main thread."""
         if self.window is not None:
             return
 
-        # Window size
-        window_width = 320
-        window_height = 80
-
-        # Position at bottom center of main screen
-        screen = NSScreen.mainScreen()
+        # Get active screen
+        screen = self.getActiveScreen()
         screen_frame = screen.frame()
-        x = (screen_frame.size.width - window_width) / 2
-        y = 100  # 100 points from bottom
 
-        frame = NSMakeRect(x, y, window_width, window_height)
+        # Position at bottom center of active screen
+        x = screen_frame.origin.x + (screen_frame.size.width - self.window_width) / 2
+        y = screen_frame.origin.y + 80  # 80 points from bottom
+
+        frame = NSMakeRect(x, y, self.window_width, self.window_height)
 
         # Create borderless, floating window
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -159,16 +198,31 @@ class IndicatorController(NSObject):
         self.window.setBackgroundColor_(NSColor.clearColor())
         self.window.setHasShadow_(True)
         self.window.setIgnoresMouseEvents_(True)
+        self.window.setCollectionBehavior_(1 << 1)  # NSWindowCollectionBehaviorCanJoinAllSpaces
 
         # Create waveform view
-        content_frame = NSMakeRect(0, 0, window_width, window_height)
+        content_frame = NSMakeRect(0, 0, self.window_width, self.window_height)
         self.waveform_view = WaveformView.alloc().initWithFrame_(content_frame)
         self.window.setContentView_(self.waveform_view)
+
+    def repositionWindow(self):
+        """Reposition window to active screen."""
+        if self.window is None:
+            return
+
+        screen = self.getActiveScreen()
+        screen_frame = screen.frame()
+
+        x = screen_frame.origin.x + (screen_frame.size.width - self.window_width) / 2
+        y = screen_frame.origin.y + 80
+
+        self.window.setFrameOrigin_((x, y))
 
     def showRecording_(self, _):
         """Show recording state."""
         self.createWindow()
-        self.waveform_view.setStatusText_("Recording...")
+        self.repositionWindow()
+        self.waveform_view.setStatusText_("REC")
         self.waveform_view.setProcessing_(False)
         self.window.orderFront_(None)
         self._is_visible = True
@@ -178,33 +232,41 @@ class IndicatorController(NSObject):
         """Show processing state."""
         if self.window and self.waveform_view:
             self._should_animate = False
-            self.waveform_view.setStatusText_("Transcribing...")
+            self.waveform_view.setStatusText_("...")
             self.waveform_view.setProcessing_(True)
             # Start animation thread
             thread = threading.Thread(target=self._animate_processing, daemon=True)
             thread.start()
 
     def _animate_processing(self):
-        """Animate processing dots in background."""
-        dots = 0
+        """Animate processing state."""
+        phase = 0
         while self._is_visible and not self._should_animate:
-            dots = (dots % 3) + 1
-            text = "Transcribing" + "." * dots
-            # Update on main thread
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "updateStatusText:", text, False
-            )
-            time.sleep(0.3)
+            # Create a wave pattern for processing
+            wave_data = []
+            for i in range(20):
+                # Sine wave animation
+                val = 0.3 + 0.2 * np.sin((i + phase) * 0.5)
+                wave_data.append(val)
 
-    def updateStatusText_(self, text):
-        """Update status text on main thread."""
-        if self.waveform_view:
-            self.waveform_view.setStatusText_(text)
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "updateProcessingWave:", wave_data, False
+            )
+            phase += 1
+            time.sleep(0.05)
+
+    def updateProcessingWave_(self, wave_data):
+        """Update processing wave animation."""
+        if self.waveform_view and self._is_visible:
+            for i, val in enumerate(wave_data):
+                if i < len(self.waveform_view.waveform_data):
+                    self.waveform_view.waveform_data[i] = val
+            self.waveform_view.setNeedsDisplay_(True)
 
     def updateWaveform_(self, data):
         """Update waveform on main thread."""
         if self.waveform_view and self._is_visible:
-            self.waveform_view.setWaveformData_(data)
+            self.waveform_view.updateWaveform_(data)
 
     def hide_(self, _):
         """Hide the indicator on main thread."""
@@ -237,7 +299,6 @@ class FloatingIndicator:
     def update_waveform(self, audio_chunk):
         """Update waveform with new audio data."""
         if self._is_visible:
-            # Convert to NSData-compatible format and update on main thread
             self.controller.performSelectorOnMainThread_withObject_waitUntilDone_(
                 "updateWaveform:", audio_chunk, False
             )

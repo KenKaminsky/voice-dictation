@@ -2,14 +2,13 @@
 """
 Voice Dictation App - Wispr Flow-like voice-to-text for macOS
 
-Hold Cmd+Shift+Space to record, release to transcribe and paste.
-Runs entirely locally using Whisper/Voxtral.
+Hold the configured hotkey to record, release to transcribe and paste.
+Runs entirely locally using Whisper.
 """
 
 import rumps
 import threading
 import subprocess
-from pynput import keyboard
 from typing import Optional
 import config
 from recorder import AudioRecorder, RECORDINGS_DIR
@@ -17,17 +16,25 @@ from transcriber import get_transcriber
 from paster import get_paster
 from storage import get_history
 from floating_indicator import get_indicator
+from keyboard_handler import HotkeyHandler, get_hotkey_display
 
 
 class VoiceDictationApp(rumps.App):
     """Menu bar application for voice dictation."""
 
     def __init__(self):
+        # Get current hotkey for display
+        hotkey_display = get_hotkey_display()
+
         # Create menu items first (store references)
         self.status_item = rumps.MenuItem("Status: Ready")
-        self.hotkey_item = rumps.MenuItem("Hotkey: Cmd+Shift+Space")
+        self.hotkey_item = rumps.MenuItem(f"Hotkey: {hotkey_display}")
         self.history_item = rumps.MenuItem("View History")
         self.load_item = rumps.MenuItem("Load Model Now")
+
+        # Create hotkey submenu
+        self.hotkey_menu = rumps.MenuItem("Change Hotkey")
+        self._build_hotkey_menu()
 
         super().__init__(
             name=config.APP_NAME,
@@ -37,6 +44,7 @@ class VoiceDictationApp(rumps.App):
                 self.status_item,
                 None,  # Separator
                 self.hotkey_item,
+                self.hotkey_menu,
                 None,  # Separator
                 self.history_item,
                 self.load_item,
@@ -53,14 +61,47 @@ class VoiceDictationApp(rumps.App):
 
         # State
         self.is_recording = False
-        self.held_keys = set()
-        self.hotkey_active = False
 
-        # Start keyboard listener in background
-        self.start_keyboard_listener()
+        # Start keyboard listener
+        self.keyboard_handler = HotkeyHandler(
+            on_press=self._on_hotkey_press,
+            on_release=self._on_hotkey_release,
+        )
+        self.keyboard_handler.start()
 
         # Pre-load model in background
         threading.Thread(target=self._preload_model, daemon=True).start()
+
+    def _build_hotkey_menu(self):
+        """Build the hotkey selection submenu."""
+        current = config.get_current_hotkey()
+
+        for hotkey_id, (name, description) in config.HOTKEY_PRESETS.items():
+            # Add checkmark to current selection
+            prefix = "✓ " if hotkey_id == current else "   "
+            item = rumps.MenuItem(
+                f"{prefix}{name}",
+                callback=lambda sender, hid=hotkey_id: self._change_hotkey(hid),
+            )
+            item.hotkey_id = hotkey_id
+            self.hotkey_menu.add(item)
+
+    def _change_hotkey(self, hotkey_id: str):
+        """Change the active hotkey."""
+        config.set_current_hotkey(hotkey_id)
+
+        # Update menu checkmarks
+        current = config.get_current_hotkey()
+        for item in self.hotkey_menu.values():
+            if hasattr(item, 'hotkey_id'):
+                name = config.HOTKEY_PRESETS[item.hotkey_id][0]
+                prefix = "✓ " if item.hotkey_id == current else "   "
+                item.title = f"{prefix}{name}"
+
+        # Update hotkey display
+        self.hotkey_item.title = f"Hotkey: {get_hotkey_display()}"
+
+        print(f"Hotkey changed to: {get_hotkey_display()}")
 
     def _preload_model(self):
         """Pre-load the transcription model in background."""
@@ -79,57 +120,6 @@ class VoiceDictationApp(rumps.App):
     def update_icon(self, icon: str):
         """Update the menu bar icon."""
         self.title = icon
-
-    def start_keyboard_listener(self):
-        """Start the global keyboard listener."""
-
-        def on_press(key):
-            # Track held keys
-            key_name = self._get_key_name(key)
-            if key_name:
-                self.held_keys.add(key_name)
-
-            # Check if hotkey combination is pressed
-            if self._is_hotkey_pressed() and not self.hotkey_active:
-                self.hotkey_active = True
-                self._on_hotkey_press()
-
-        def on_release(key):
-            key_name = self._get_key_name(key)
-            if key_name and key_name in self.held_keys:
-                self.held_keys.discard(key_name)
-
-            # Check if hotkey was released
-            if self.hotkey_active and not self._is_hotkey_pressed():
-                self.hotkey_active = False
-                self._on_hotkey_release()
-
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        listener.daemon = True
-        listener.start()
-        print("Keyboard listener started")
-
-    def _get_key_name(self, key) -> Optional[str]:
-        """Convert pynput key to string name."""
-        try:
-            if hasattr(key, "char") and key.char:
-                return key.char.lower()
-            elif hasattr(key, "name"):
-                return key.name.lower()
-            elif key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
-                return "cmd"
-            elif key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
-                return "shift"
-            elif key == keyboard.Key.space:
-                return "space"
-        except Exception:
-            pass
-        return None
-
-    def _is_hotkey_pressed(self) -> bool:
-        """Check if the hotkey combination is currently pressed."""
-        required = config.HOTKEY_MODIFIERS | {config.HOTKEY_KEY}
-        return required.issubset(self.held_keys)
 
     def _on_audio_chunk(self, chunk):
         """Called with each audio chunk during recording."""
@@ -237,10 +227,12 @@ class VoiceDictationApp(rumps.App):
 
 def main():
     """Main entry point."""
+    hotkey_display = get_hotkey_display()
+
     print("=" * 50)
     print("Voice Dictation App")
     print("=" * 50)
-    print(f"Hotkey: Cmd+Shift+Space (hold to record)")
+    print(f"Hotkey: {hotkey_display}")
     print(f"Model: {config.MODEL_ID}")
     print("=" * 50)
     print()
