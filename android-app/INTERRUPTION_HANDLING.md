@@ -4,13 +4,29 @@
 
 ### CRITICAL PRINCIPLE
 
-**No external event should EVER stop or corrupt a recording.**
+# NOTHING STOPS RECORDING EXCEPT THE USER
 
-The recording must continue through ALL of the following. If the system forces audio interruption, we must:
-1. Save all audio captured so far (immediately)
-2. Resume recording the moment the interruption ends
-3. Mark the gap in metadata for user awareness
-4. NEVER lose a single sample that was captured
+**No external event should EVER stop, pause, or interrupt a recording.**
+
+This is absolute. Non-negotiable. The ONLY way recording stops is:
+- User explicitly presses Stop
+- Phone physically shuts down (battery dead, forced reboot)
+
+Everything else - calls, notifications, alarms, other apps, system events - is **IGNORED**.
+
+| Event | Traditional App Behavior | OUR Behavior |
+|-------|-------------------------|--------------|
+| Incoming call | Stop/pause recording | **IGNORE - keep recording** |
+| Call answered | Stop recording | **IGNORE - keep recording** |
+| Alarm | Pause recording | **IGNORE - keep recording** |
+| Other app wants mic | Give up mic | **REFUSE - keep recording** |
+| Audio focus lost | Stop recording | **IGNORE - keep recording** |
+| Low battery | Warn and stop | **KEEP RECORDING until shutdown** |
+| App backgrounded | Stop recording | **KEEP RECORDING** |
+
+### If the phone can still power the microphone, we are recording.
+
+The caller can hear silence. The alarm can be muted. Other apps can fail. We don't care. Recording is sacred.
 
 ---
 
@@ -18,64 +34,127 @@ The recording must continue through ALL of the following. If the system forces a
 
 ### Category 1: Phone Calls
 
-| Interruption | System Behavior | Our Response |
-|--------------|-----------------|--------------|
-| **Incoming cellular call** | System takes audio focus | Continue recording via secondary channel OR pause + auto-resume |
-| **Outgoing cellular call** | System takes audio focus | Same as above |
-| **Incoming WhatsApp call** | App requests audio focus | IGNORE their focus request, keep recording |
-| **Incoming Telegram call** | App requests audio focus | IGNORE their focus request, keep recording |
-| **Incoming Zoom/Meet call** | App requests audio focus | IGNORE their focus request, keep recording |
-| **Any VoIP call** | App requests audio focus | IGNORE their focus request, keep recording |
+# ALL INCOMING CALLS ARE BLOCKED DURING RECORDING
 
-**Implementation Strategy:**
+**Calls don't just fail to interrupt - they are actively REJECTED.**
+
+| Interruption | Our Response | Caller Experience |
+|--------------|--------------|-------------------|
+| **Incoming cellular call** | **REJECT immediately** | Goes to voicemail / shows as missed |
+| **Incoming WhatsApp call** | **REJECT immediately** | Shows as missed call |
+| **Incoming Telegram call** | **REJECT immediately** | Shows as missed call |
+| **Incoming Zoom/Meet call** | **REJECT immediately** | Shows as missed/declined |
+| **Any VoIP call** | **REJECT immediately** | Shows as missed/declined |
+
+**The phone doesn't ring. The call is rejected before it can interfere. Recording continues undisturbed.**
+
+**Implementation: CallScreeningService (Android 10+)**
 
 ```kotlin
-// We request AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE and NEVER release it during recording
-audioManager.requestAudioFocus(
-    focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-        .setOnAudioFocusChangeListener { focusChange ->
-            // IGNORE all focus changes during recording
-            // Log for debugging but DO NOT stop recording
-            Log.w("Recording", "Audio focus change ignored: $focusChange")
-        }
-        .setAcceptsDelayedFocusGain(false)
-        .build()
-)
+// AndroidManifest.xml
+<service
+    android:name=".service.RecordingCallScreener"
+    android:permission="android.permission.BIND_SCREENING_SERVICE">
+    <intent-filter>
+        <action android:name="android.telecom.CallScreeningService" />
+    </intent-filter>
+</service>
+
+// Also need user to set us as default Call Screening app
+// Or use ANSWER_PHONE_CALLS permission for direct rejection
 ```
 
-**For Cellular Calls (Cannot Ignore):**
+```kotlin
+class RecordingCallScreener : CallScreeningService() {
 
-Android gives cellular calls priority over everything. Strategy:
+    override fun onScreenCall(callDetails: Call.Details) {
+        // Check if we're currently recording
+        if (RecordingService.isRecording) {
+            // REJECT the call immediately
+            val response = CallResponse.Builder()
+                .setDisallowCall(true)           // Block the call
+                .setRejectCall(true)             // Reject it (goes to voicemail)
+                .setSkipCallLog(false)           // Show in call log as missed
+                .setSkipNotification(true)       // Don't show incoming call notification
+                .setSilenceCall(true)            // No ringtone
+                .build()
 
-1. **Detect incoming call** via `TelephonyManager.listen(LISTEN_CALL_STATE)`
-2. **Before call connects**: Flush current chunk to disk immediately
-3. **During call**:
-   - Option A: Keep recording (call audio may bleed in - acceptable)
-   - Option B: Pause recording, create gap marker
-4. **After call ends**: Auto-resume recording seamlessly
-5. **Metadata**: Mark the interruption with timestamps
+            respondToCall(callDetails, response)
+
+            // Log for metadata
+            RecordingService.addMetadataEvent(
+                "call_blocked",
+                mapOf("number" to callDetails.handle.toString())
+            )
+
+            Log.i("CallScreener", "Blocked incoming call during recording")
+        } else {
+            // Not recording - let call through normally
+            val response = CallResponse.Builder()
+                .setDisallowCall(false)
+                .build()
+            respondToCall(callDetails, response)
+        }
+    }
+}
+```
+
+**Alternative: TelecomManager Reject (Android 9+)**
 
 ```kotlin
-class CallInterruptionHandler : PhoneStateListener() {
-    override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-        when (state) {
-            TelephonyManager.CALL_STATE_RINGING -> {
-                // Incoming call - flush current audio immediately
-                recordingService.flushCurrentChunk()
-                recordingService.markInterruptionStart("incoming_call")
-            }
-            TelephonyManager.CALL_STATE_OFFHOOK -> {
-                // Call answered - continue recording (captures both sides)
-                // OR pause if user prefers privacy
-            }
-            TelephonyManager.CALL_STATE_IDLE -> {
-                // Call ended - ensure recording continues
-                recordingService.markInterruptionEnd()
-                recordingService.ensureRecording()
+class CallRejecter : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == TelephonyManager.ACTION_PHONE_STATE_CHANGED) {
+            val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE)
+
+            if (state == TelephonyManager.EXTRA_STATE_RINGING && RecordingService.isRecording) {
+                // Reject the call
+                val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+
+                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    telecomManager.endCall()  // Immediately end/reject the incoming call
+                    Log.i("CallRejecter", "Rejected incoming call during recording")
+                }
             }
         }
     }
 }
+```
+
+**Required Permissions:**
+
+```xml
+<uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+<uses-permission android:name="android.permission.READ_PHONE_STATE" />
+<uses-permission android:name="android.permission.READ_CALL_LOG" />
+```
+
+**For VoIP Apps (WhatsApp, Telegram, etc.):**
+
+VoIP apps use audio focus - we simply REFUSE to give it up:
+
+```kotlin
+// When recording, we hold exclusive audio focus
+// VoIP apps will fail to acquire mic and show "call failed" or similar
+
+val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+    .setOnAudioFocusChangeListener { focusChange ->
+        // IGNORE ALL FOCUS CHANGES
+        Log.w("Recording", "Audio focus request DENIED to other app: $focusChange")
+    }
+    .setAcceptsDelayedFocusGain(false)
+    .setWillPauseWhenDucked(false)
+    .build()
+
+audioManager.requestAudioFocus(focusRequest)
+```
+
+**User Notification:**
+
+After recording ends, show notification:
+> "2 calls were blocked during your recording"
+> [View Details] [Call Back]
 ```
 
 ### Category 2: Notifications & Sounds
@@ -270,23 +349,38 @@ When any interruption occurs, record it in the session metadata:
 
 ### Test Cases (Must Pass All)
 
+**CRITICAL: In ALL these tests, recording must NEVER stop. Not pause. Not interrupt. NEVER.**
+
+| Test ID | Scenario | Expected Result | FAIL if |
+|---------|----------|-----------------|---------|
+| INT-01 | Start recording, receive phone call | Call REJECTED, caller goes to voicemail, recording continues | Phone rings or recording stops |
+| INT-02 | Start recording, receive 5 phone calls | All 5 calls REJECTED, recording continues, notification shows "5 calls blocked" | Any call gets through |
+| INT-03 | Start recording, receive WhatsApp call | Call REJECTED/fails, recording continues | Recording stops or pauses |
+| INT-04 | Start recording, receive Telegram call | Call REJECTED/fails, recording continues | Recording stops or pauses |
+| INT-05 | Start recording, alarm goes off for 1 minute | Recording continues through alarm | Recording stopped |
+| INT-06 | Start recording, play music in Spotify | Spotify silenced OR muted, recording continues | Recording stopped |
+| INT-07 | Start recording, press Home, open other apps | Recording continues | Recording stopped |
+| INT-08 | Start recording, screen off for 30 minutes | Recording continues, all chunks saved | Any gap or stop |
+| INT-09 | Start recording, plug/unplug headphones 5 times | Recording continues | Any gap |
+| INT-10 | Start recording, connect/disconnect Bluetooth | Recording continues | Any gap |
+| INT-11 | Start recording, swipe app away from recents | Recording continues via service | Recording stopped |
+| INT-12 | Start recording, enter split-screen mode | Recording continues | Recording stopped |
+| INT-13 | Start recording, receive 50 notifications rapidly | Recording continues | Any interruption |
+| INT-14 | Start recording, trigger Google Assistant | Recording continues, Assistant may fail | Recording stopped |
+| INT-15 | Start recording, another app tries to use mic | Other app fails, recording continues | Recording stopped |
+| INT-16 | Start recording, open Camera app | Camera may fail to record, our recording continues | Recording stopped |
+| INT-17 | Start recording, open another voice recorder | Other recorder fails, our recording continues | Recording stopped |
+| INT-18 | Start recording, phone goes to 1% battery | Recording continues until actual shutdown | Recording stopped early |
+
+### Force Stop & Crash Recovery Tests
+
 | Test ID | Scenario | Expected Result |
 |---------|----------|-----------------|
-| INT-01 | Start recording, receive phone call, answer, hang up | Recording continues with metadata marker |
-| INT-02 | Start recording, receive WhatsApp call, decline | Recording never interrupted |
-| INT-03 | Start recording, alarm goes off | Recording continues |
-| INT-04 | Start recording, play music in Spotify | Spotify silenced, recording continues |
-| INT-05 | Start recording, press Home, open other apps | Recording continues |
-| INT-06 | Start recording, screen off for 10 minutes | Recording continues |
-| INT-07 | Start recording, plug/unplug headphones | Recording continues |
-| INT-08 | Start recording, connect/disconnect Bluetooth | Recording continues |
-| INT-09 | Start recording, reboot phone | Chunk saved, can recover |
-| INT-10 | Start recording, battery dies | Chunks saved, can recover |
-| INT-11 | Start recording, swipe app away | Recording continues |
-| INT-12 | Start recording, force stop app | Current chunk saved |
-| INT-13 | Start recording, enter split-screen | Recording continues |
-| INT-14 | Start recording, receive 50 notifications | Recording continues |
-| INT-15 | Start recording, Google Assistant triggered | Recording continues |
+| REC-01 | Force stop app mid-recording | All chunks up to that point saved and recoverable |
+| REC-02 | Kill process via ADB mid-recording | All chunks up to that point saved |
+| REC-03 | Phone crashes/reboots mid-recording | All written chunks recoverable after boot |
+| REC-04 | Pull battery (if possible) mid-recording | All written chunks recoverable |
+| REC-05 | Storage fills up mid-recording | Error shown, but existing chunks preserved |
 
 ---
 
